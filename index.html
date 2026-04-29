@@ -1,0 +1,467 @@
+<!DOCTYPE html>
+<html lang="ja">
+<head>
+    <meta charset="UTF-8">
+    <title>Emoji Hunt - Movement Balanced</title>
+    <script src="https://cdn.jsdelivr.net/npm/@mediapipe/face_mesh/face_mesh.js" crossorigin="anonymous"></script>
+    <script src="https://cdn.jsdelivr.net/npm/@mediapipe/camera_utils/camera_utils.js" crossorigin="anonymous"></script>
+    
+    <style>
+        body { 
+            margin: 0; 
+            background: #050510; 
+            color: #eee; 
+            font-family: 'Segoe UI', sans-serif; 
+            display: flex; 
+            justify-content: center; 
+            align-items: center;     
+            height: 100vh;
+            width: 100vw;
+            overflow: hidden;
+        }
+
+        #game-container {
+            display: flex;
+            gap: 20px;
+            align-items: flex-start;
+        }
+
+        canvas { 
+            background: radial-gradient(circle, #111 0%, #000 100%); 
+            border: 4px solid #444; 
+            display: block;
+            box-shadow: 0 0 50px rgba(0, 210, 255, 0.3);
+            border-radius: 12px;
+        }
+
+        #side-panel {
+            display: flex;
+            flex-direction: column;
+            width: 190px;
+            background: rgba(255, 255, 255, 0.08);
+            padding: 15px;
+            border-radius: 15px;
+            border: 1px solid #555;
+            margin-top: 60px;
+            margin-right: 40px;
+        }
+
+        #video-container {
+            width: 170px;
+            height: 128px;
+            border: 2px solid #666;
+            border-radius: 8px;
+            overflow: hidden;
+            background: #000;
+        }
+
+        video { 
+            transform: scaleX(-1); 
+            width: 100%;
+            height: 100%;
+            object-fit: cover;
+        }
+
+        .stat-card {
+            background: rgba(0, 0, 0, 0.7);
+            border: 1px solid #444;
+            border-radius: 10px;
+            padding: 12px;
+            margin-top: 12px;
+            text-align: center;
+        }
+
+        .label {
+            font-size: 11px;
+            color: #aaa;
+            text-transform: uppercase;
+            letter-spacing: 1.5px;
+            margin-bottom: 4px;
+            display: block;
+        }
+
+        .value {
+            font-size: 26px;
+            font-weight: bold;
+            color: #00d2ff;
+        }
+
+        select {
+            background: #222;
+            color: #00d2ff;
+            border: 1px solid #444;
+            border-radius: 4px;
+            padding: 5px;
+            width: 90%;
+            font-weight: bold;
+            cursor: pointer;
+            outline: none;
+        }
+    </style>
+</head>
+<body>
+
+    <div id="game-container">
+        <div id="game-area">
+            <canvas id="gameCanvas"></canvas>
+        </div>
+
+        <div id="side-panel">
+            <div id="video-container">
+                <video id="input_video"></video>
+            </div>
+            <div id="stats">
+                <div class="stat-card">
+                    <span class="label">Time Left</span>
+                    <span id="timer" class="value">60</span>
+                </div>
+                <div class="stat-card">
+                    <span class="label">Score</span>
+                    <span id="score" class="value">0</span>
+                </div>
+                <div class="stat-card">
+                    <span class="label">Emoji Speed</span>
+                    <select id="speed-select">
+                        <option value="0.4">1 (Very Slow)</option>
+                        <option value="1.2" selected>2 (Slow)</option>
+                        <option value="2.5">3 (Normal)</option>
+                        <option value="4.5">4 (Fast)</option>
+                    </select>
+                </div>
+            </div>
+        </div>
+    </div>
+
+<script>
+/**
+ * 1. 定数と基本設定
+ */
+const canvas = document.getElementById('gameCanvas');
+const ctx = canvas.getContext('2d');
+canvas.width = 1000;
+canvas.height = 650;
+
+const playerWidth = 80;
+const playerY = canvas.height - 100;
+let playerX = (canvas.width - playerWidth) / 2;
+let playerHitTimer = 0;
+
+// 食い込み（オーバーラップ）の許容範囲：自機幅の1/3
+const playerOverlap = playerWidth / 3; 
+
+const emojiList = ["😀", "😁", "😂", "🤣", "😃", "😄", "😅", "😆", "😉", "😊"];
+let floatingEmojis = [];
+let targetEmoji = "";
+const EMOJI_FONT_SIZE = 70;
+
+const LEFT_WALL_MARGIN = 75;  
+const RIGHT_WALL_MARGIN = 40; 
+const TOP_LIMIT = 180;
+const BOTTOM_LIMIT = playerY - 45;
+
+let playerBullets = [];
+const pBulletSpeed = 18;
+
+let score = 0;
+let timeLeft = 60;
+let gameRunning = false;
+let message = "カメラ準備中...";
+let timerInterval = null;
+let canRestartTime = 0;
+
+let baseFaceX = null;
+const mouthThreshold = 0.035; 
+let wasMouthOpen = false;
+
+const speedSelect = document.getElementById('speed-select');
+let currentSpeedMultiplier = parseFloat(speedSelect.value);
+
+/**
+ * 2. オーディオ設定
+ */
+const audioCtx = new (window.AudioContext || window.webkitAudioContext)();
+function playTone(freq, type, decay, vol) {
+    if (audioCtx.state === 'suspended') audioCtx.resume();
+    const osc = audioCtx.createOscillator();
+    const gain = audioCtx.createGain();
+    osc.type = type;
+    osc.frequency.setValueAtTime(freq, audioCtx.currentTime);
+    gain.gain.setValueAtTime(vol, audioCtx.currentTime);
+    gain.gain.exponentialRampToValueAtTime(0.01, audioCtx.currentTime + decay);
+    osc.connect(gain);
+    gain.connect(audioCtx.destination);
+    osc.start();
+    osc.stop(audioCtx.currentTime + decay);
+}
+
+const Sound = {
+    start: () => {
+        playTone(440, 'square', 0.1, 0.1);
+        setTimeout(() => playTone(660, 'square', 0.1, 0.1), 80);
+        setTimeout(() => playTone(880, 'square', 0.2, 0.1), 160);
+    },
+    shoot: () => playTone(1000, 'sine', 0.08, 0.04),
+    hitCorrect: () => {
+        playTone(900, 'sine', 0.1, 0.1);
+        setTimeout(() => playTone(1400, 'sine', 0.15, 0.08), 60);
+    },
+    hitWrong: () => {
+        playTone(180, 'sawtooth', 0.4, 0.12);
+    }
+};
+
+/**
+ * 3. 速度制御
+ */
+speedSelect.addEventListener('change', (e) => {
+    const oldMult = currentSpeedMultiplier;
+    currentSpeedMultiplier = parseFloat(e.target.value);
+    floatingEmojis.forEach(em => {
+        em.vx = (em.vx / oldMult) * currentSpeedMultiplier;
+        em.vy = (em.vy / oldMult) * currentSpeedMultiplier;
+    });
+});
+
+/**
+ * 4. ゲームコアロジック
+ */
+function spawnEmojis() {
+    floatingEmojis = [];
+    emojiList.forEach((char) => {
+        const angle = Math.random() * Math.PI * 2;
+        const speed = (0.6 + Math.random()) * currentSpeedMultiplier;
+        floatingEmojis.push({
+            char: char,
+            x: Math.random() * (canvas.width - 400) + 200,
+            y: Math.random() * (canvas.height - 400) + 200,
+            vx: Math.cos(angle) * speed,
+            vy: Math.sin(angle) * speed,
+            size: EMOJI_FONT_SIZE
+        });
+    });
+}
+
+function setNewTarget() {
+    targetEmoji = emojiList[Math.floor(Math.random() * emojiList.length)];
+}
+
+function resetGame() {
+    if (timerInterval) {
+        clearInterval(timerInterval);
+        timerInterval = null;
+    }
+    score = 0;
+    timeLeft = 60;
+    gameRunning = false;
+    playerBullets = [];
+    baseFaceX = null;
+    message = "口を開けてスタート！";
+    setNewTarget();
+    spawnEmojis();
+    updateUI();
+}
+
+function startGame() {
+    if (gameRunning) return;
+    gameRunning = true;
+    message = "";
+    Sound.start();
+    
+    if (timerInterval) clearInterval(timerInterval);
+    timerInterval = setInterval(() => {
+        if (gameRunning) {
+            timeLeft--;
+            updateUI();
+            if (timeLeft <= 0) endGame("TIME UP!");
+        }
+    }, 1000);
+}
+
+function endGame(msg) {
+    gameRunning = false;
+    if (timerInterval) {
+        clearInterval(timerInterval);
+        timerInterval = null;
+    }
+    message = msg;
+    canRestartTime = Date.now() + 3000; 
+    setTimeout(resetGame, 3000);
+}
+
+function updateUI() {
+    document.getElementById('score').innerText = score;
+    document.getElementById('timer').innerText = timeLeft;
+}
+
+/**
+ * 5. MediaPipe 顔認識
+ */
+const videoElement = document.getElementById('input_video');
+const faceMesh = new FaceMesh({
+    locateFile: (file) => `https://cdn.jsdelivr.net/npm/@mediapipe/face_mesh/${file}`
+});
+
+faceMesh.setOptions({
+    maxNumFaces: 1,
+    refineLandmarks: true,
+    minDetectionConfidence: 0.7,
+    minTrackingConfidence: 0.7
+});
+
+faceMesh.onResults((results) => {
+    if (!results.multiFaceLandmarks || results.multiFaceLandmarks.length === 0) return;
+    const landmarks = results.multiFaceLandmarks[0];
+    const currentFaceX = landmarks[1].x; 
+    const mouthDist = Math.abs(landmarks[11].y - landmarks[16].y);
+
+    if (baseFaceX === null) baseFaceX = currentFaceX;
+    
+    const sensitivity = 3.8;
+    let diff = (baseFaceX - currentFaceX) * sensitivity;
+    let targetX = (canvas.width / 2 - playerWidth / 2) + (diff * canvas.width);
+    
+    // 【修正】左側は変更前(20pxマージン)に戻し、右側は1/3食い込み許可
+    // 左端制限: 20px (これより左には行かない)
+    // 右端制限: canvas.width - playerWidth + playerOverlap (1/3食い込む)
+    playerX = Math.max(20, Math.min(canvas.width - playerWidth + playerOverlap, targetX));
+
+    const isMouthOpen = mouthDist > mouthThreshold;
+
+    if (!gameRunning && message === "口を開けてスタート！" && isMouthOpen && Date.now() > canRestartTime) {
+        startGame();
+    } 
+    else if (gameRunning && isMouthOpen && !wasMouthOpen) {
+        playerBullets.push({ x: playerX + playerWidth / 2 - 3, y: playerY });
+        Sound.shoot();
+    }
+    wasMouthOpen = isMouthOpen;
+});
+
+const camera = new Camera(videoElement, {
+    onFrame: async () => { await faceMesh.send({image: videoElement}); },
+    width: 320, height: 240
+});
+camera.start();
+
+/**
+ * 6. 描画ループ
+ */
+function draw() {
+    ctx.clearRect(0, 0, canvas.width, canvas.height);
+    
+    if (gameRunning) {
+        updateEmojis();
+        updateBullets();
+    }
+    
+    drawTargetInfo();
+    drawEmojis();
+    drawPlayer();
+    drawBullets();
+    drawMessages();
+    requestAnimationFrame(draw);
+}
+
+function drawTargetInfo() {
+    if(!gameRunning && message.includes("準備中")) return;
+    const boxX = canvas.width/2 - 75, boxY = 40;
+    ctx.fillStyle = "rgba(0, 210, 255, 0.15)";
+    ctx.fillRect(boxX, boxY, 150, 110);
+    ctx.strokeStyle = "#00d2ff";
+    ctx.lineWidth = 4;
+    ctx.strokeRect(boxX, boxY, 150, 110);
+    ctx.font = "bold 15px sans-serif";
+    ctx.fillStyle = "#00d2ff";
+    ctx.textAlign = "center";
+    ctx.fillText("TARGET", canvas.width / 2, boxY + 25);
+    ctx.font = "70px sans-serif";
+    ctx.textBaseline = "middle"; 
+    ctx.fillText(targetEmoji, canvas.width / 2, boxY + 70);
+    ctx.textBaseline = "alphabetic";
+}
+
+function drawPlayer() {
+    ctx.fillStyle = playerHitTimer > 0 ? "#ff4444" : "#00ff00";
+    if (playerHitTimer > 0) playerHitTimer--;
+    
+    ctx.fillRect(playerX, playerY + 15, playerWidth, 25);
+    ctx.fillRect(playerX + (playerWidth/2 - 12), playerY, 24, 15);
+}
+
+function drawEmojis() {
+    ctx.save();
+    ctx.textAlign = "center";
+    ctx.textBaseline = "middle";
+    floatingEmojis.forEach(em => {
+        ctx.font = `${em.size}px sans-serif`;
+        ctx.fillStyle = "#fff";
+        ctx.fillText(em.char, em.x, em.y);
+    });
+    ctx.restore();
+}
+
+function drawBullets() {
+    ctx.fillStyle = "#fff";
+    playerBullets.forEach(b => ctx.fillRect(b.x, b.y, 6, 22));
+}
+
+function updateEmojis() {
+    floatingEmojis.forEach(em => {
+        em.x += em.vx;
+        em.y += em.vy;
+        if (em.x <= LEFT_WALL_MARGIN) { em.x = LEFT_WALL_MARGIN + 1; em.vx = Math.abs(em.vx); }
+        if (em.x >= canvas.width - RIGHT_WALL_MARGIN) { em.x = canvas.width - RIGHT_WALL_MARGIN - 1; em.vx = -Math.abs(em.vx); }
+        if (em.y <= TOP_LIMIT) { em.y = TOP_LIMIT + 1; em.vy = Math.abs(em.vy); }
+        if (em.y >= BOTTOM_LIMIT) { em.y = BOTTOM_LIMIT - 1; em.vy = -Math.abs(em.vy); }
+    });
+}
+
+function updateBullets() {
+    for (let i = playerBullets.length - 1; i >= 0; i--) {
+        playerBullets[i].y -= pBulletSpeed;
+        if (playerBullets[i].y < 0) {
+            playerBullets.splice(i, 1);
+            continue;
+        }
+
+        for (let j = floatingEmojis.length - 1; j >= 0; j--) {
+            let em = floatingEmojis[j];
+            let dist = Math.hypot(playerBullets[i].x - em.x, playerBullets[i].y - em.y);
+            if (dist < 40) {
+                if (em.char === targetEmoji) {
+                    score += 10;
+                    Sound.hitCorrect();
+                    setNewTarget();
+                    spawnEmojis(); 
+                } else {
+                    score -= 5;
+                    playerHitTimer = 10;
+                    Sound.hitWrong();
+                    floatingEmojis.splice(j, 1); 
+                }
+                updateUI();
+                playerBullets.splice(i, 1);
+                break;
+            }
+        }
+    }
+}
+
+function drawMessages() {
+    if (message !== "") {
+        ctx.textAlign = "center";
+        ctx.textBaseline = "middle";
+        ctx.font = "bold 60px sans-serif";
+        ctx.fillStyle = "#fff";
+        ctx.shadowBlur = 15;
+        ctx.shadowColor = "#00d2ff";
+        ctx.fillText(message, canvas.width / 2, canvas.height / 2);
+        ctx.shadowBlur = 0;
+    }
+}
+
+resetGame();
+draw();
+</script>
+</body>
+</html>
